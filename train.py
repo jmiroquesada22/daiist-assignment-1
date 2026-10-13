@@ -1,18 +1,30 @@
 """Assignment 1: training pipeline (Telco customer churn)."""
+import json
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn.functional as F
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from torch import nn
 
 SEED = 42
 DATA_PATH = "data/telco.csv"
 ARTIFACTS = Path("artifacts")
+
+# Business costs (assumptions, see REPORT.md): a missed churner vs. a wasted offer
+COST_FN = 400.0
+COST_FP = 50.0
+
+# PyTorch optimisation settings (same for both PyTorch versions)
+LR = 0.5
+EPOCHS = 20000
 
 ADDONS = ["OnlineSecurity", "OnlineBackup", "DeviceProtection",
           "TechSupport", "StreamingTV", "StreamingMovies"]
@@ -21,51 +33,38 @@ CAT_COLS = ["gender", "Partner", "Dependents", "PhoneService", "MultipleLines",
             "InternetService"] + ADDONS + ["PaperlessBilling"]
 
 
+# ---------- data ----------
 def load_and_clean(path=DATA_PATH):
     df = pd.read_csv(path)
-
-    # customerID is an identifier, so it carries no signal
-    df = df.drop(columns=["customerID"])
-
-    # TotalCharges is text because a few rows hold blank strings.
-    # Check that those are all customers with tenure == 0 before filling.
+    df = df.drop(columns=["customerID"])  # identifier, no signal
     total = pd.to_numeric(df["TotalCharges"], errors="coerce")
     blank = total.isna()
     assert (df.loc[blank, "tenure"] == 0).all(), "blank TotalCharges with tenure > 0"
     df["TotalCharges"] = total.fillna(0.0)
-
-    # Target: 1 = churned, 0 = stayed
     df["Churn"] = (df["Churn"] == "Yes").astype(int)
     return df
 
 
 def split_data(df):
-    # 60% train / 20% validation / 20% test, stratified on the target
     train_df, temp_df = train_test_split(
-        df, test_size=0.4, stratify=df["Churn"], random_state=SEED
-    )
+        df, test_size=0.4, stratify=df["Churn"], random_state=SEED)
     val_df, test_df = train_test_split(
-        temp_df, test_size=0.5, stratify=temp_df["Churn"], random_state=SEED
-    )
+        temp_df, test_size=0.5, stratify=temp_df["Churn"], random_state=SEED)
     return train_df, val_df, test_df
 
 
 def engineer_features(df):
     """Row-wise transformations only: nothing here learns from the data."""
     X = pd.DataFrame(index=df.index)
-    # log1p: churn falls steeply in the first year then flattens; log(1+0)=0 is safe
     X["tenure_log"] = np.log1p(df["tenure"])
     X["MonthlyCharges"] = df["MonthlyCharges"]
     X["SeniorCitizen"] = df["SeniorCitizen"]
-    # Electronic check churns ~45%, every other method 15-19%: one flag captures it
     X["is_echeck"] = (df["PaymentMethod"] == "Electronic check").astype(int)
-    # Churn falls monotonically 43% -> 11% -> 3% across contract lengths
     X["contract_ord"] = df["Contract"].map(
         {"Month-to-month": 0, "One year": 1, "Two year": 2})
     for c in ["gender", "Partner", "Dependents", "PhoneService", "InternetService",
               "PaperlessBilling"]:
         X[c] = df[c]
-    # "No internet/phone service" duplicates InternetService/PhoneService, so merge into "No"
     for c in ADDONS + ["MultipleLines"]:
         X[c] = df[c].replace({"No internet service": "No", "No phone service": "No"})
     return X[NUM_COLS + CAT_COLS]
@@ -77,32 +76,157 @@ def build_preprocessor():
             ("num", StandardScaler(), NUM_COLS),
             ("cat", OneHotEncoder(drop="if_binary", handle_unknown="ignore"), CAT_COLS),
         ],
-        sparse_threshold=0,  # always return a dense array (PyTorch needs dense)
+        sparse_threshold=0,
     )
+
+
+# ---------- business metric ----------
+def expected_cost(y, p, thr):
+    pred = p >= thr
+    fn = np.sum((y == 1) & ~pred)
+    fp = np.sum((y == 0) & pred)
+    return COST_FN * fn + COST_FP * fp
+
+
+def best_threshold(y, p):
+    grid = np.linspace(0.01, 0.99, 99)
+    return float(grid[int(np.argmin([expected_cost(y, p, t) for t in grid]))])
+
+
+# ---------- model 1: scikit-learn ----------
+def fit_sklearn(X_tr, y_tr, X_val, y_val):
+    best = None
+    for C in [0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0]:  # the only tuned knob
+        m = LogisticRegression(C=C, max_iter=10000, tol=1e-10).fit(X_tr, y_tr)
+        ll = log_loss(y_val, m.predict_proba(X_val)[:, 1])
+        if best is None or ll < best[0]:
+            best = (ll, C, m)
+    return best[1], best[2]
+
+
+# ---------- model 2: manual PyTorch loop ----------
+def fit_manual(X, y, lam, lr=LR, epochs=EPOCHS):
+    Xt = torch.tensor(X, dtype=torch.float64)
+    yt = torch.tensor(y, dtype=torch.float64)
+    w = torch.zeros(X.shape[1], dtype=torch.float64, requires_grad=True)
+    b = torch.zeros(1, dtype=torch.float64, requires_grad=True)
+    for _ in range(epochs):
+        logits = Xt @ w + b
+        # binary cross-entropy written out: softplus(z) - y*z == -[y log s(z) + (1-y) log(1-s(z))]
+        bce = (F.softplus(logits) - yt * logits).mean()
+        loss = bce + 0.5 * lam * (w ** 2).sum()  # L2 on weights only, not the bias
+        loss.backward()
+        with torch.no_grad():  # manual gradient step
+            w -= lr * w.grad
+            b -= lr * b.grad
+        w.grad.zero_()
+        b.grad.zero_()
+    return w.detach().numpy(), b.detach().numpy()
+
+
+# ---------- model 3: nn.Module + torch.optim ----------
+class LogReg(nn.Module):
+    def __init__(self, d):
+        super().__init__()
+        self.linear = nn.Linear(d, 1)
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x):
+        return self.linear(x).squeeze(1)
+
+
+def fit_module(X, y, lam, lr=LR, epochs=EPOCHS):
+    Xt = torch.tensor(X, dtype=torch.float64)
+    yt = torch.tensor(y, dtype=torch.float64)
+    model = LogReg(X.shape[1]).double()
+    # weight_decay adds lam*w to the gradient, matching the manual L2 term; bias gets none
+    opt = torch.optim.SGD(
+        [{"params": [model.linear.weight], "weight_decay": lam},
+         {"params": [model.linear.bias], "weight_decay": 0.0}],
+        lr=lr)
+    loss_fn = nn.BCEWithLogitsLoss()
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss_fn(model(Xt), yt).backward()
+        opt.step()
+    return model
+
+
+def evaluate(name, y_val, p_val, y_test, p_test):
+    thr = best_threshold(y_val, p_val)  # threshold chosen on VALIDATION only
+    cost = expected_cost(y_test, p_test, thr)
+    return {"model": name, "threshold": thr,
+            "test_auc": float(roc_auc_score(y_test, p_test)),
+            "test_logloss": float(log_loss(y_test, p_test)),
+            "test_cost": float(cost), "cost_per_customer": float(cost / len(y_test))}
 
 
 def main():
     ARTIFACTS.mkdir(exist_ok=True)
     df = load_and_clean()
     train_df, val_df, test_df = split_data(df)
-    for name, part in [("train", train_df), ("val", val_df), ("test", test_df)]:
-        print(f"{name}: {len(part)} rows, churn rate {part['Churn'].mean():.3f}")
 
-    # Fit the scaler/encoder on TRAIN only, then apply to all three splits
     prep = build_preprocessor()
-    X_train = prep.fit_transform(engineer_features(train_df)).astype(np.float32)
-    X_val = prep.transform(engineer_features(val_df)).astype(np.float32)
-    X_test = prep.transform(engineer_features(test_df)).astype(np.float32)
-    y_train = train_df["Churn"].to_numpy()
-    y_val = val_df["Churn"].to_numpy()
-    y_test = test_df["Churn"].to_numpy()
-    print("feature matrix shapes:", X_train.shape, X_val.shape, X_test.shape)
+    X_tr = prep.fit_transform(engineer_features(train_df)).astype(np.float64)  # fit on TRAIN only
+    X_va = prep.transform(engineer_features(val_df)).astype(np.float64)
+    X_te = prep.transform(engineer_features(test_df)).astype(np.float64)
+    y_tr, y_va, y_te = (d["Churn"].to_numpy() for d in (train_df, val_df, test_df))
     joblib.dump(prep, ARTIFACTS / "preprocessor.joblib")
+    feature_names = [str(n) for n in prep.get_feature_names_out()]
 
-    # Sanity check only (not the final model): should be near AUC 0.863, log-loss 0.396
-    clf = LogisticRegression(max_iter=1000).fit(X_train, y_train)
-    p = clf.predict_proba(X_val)[:, 1]
-    print(f"sanity val AUC {roc_auc_score(y_val, p):.4f}, log-loss {log_loss(y_val, p):.4f}")
+    # Fit all three on the same train split
+    C, sk = fit_sklearn(X_tr, y_tr, X_va, y_va)
+    lam = 1.0 / (C * len(y_tr))  # maps sklearn's C onto a mean-loss L2 strength
+    print(f"sklearn: chosen C={C}  ->  PyTorch L2 strength lam=1/(C*n)={lam:.3e}")
+    w_man, b_man = fit_manual(X_tr, y_tr, lam)
+    mod = fit_module(X_tr, y_tr, lam)
+
+    # Do the three agree?
+    w_mod = mod.linear.weight.detach().numpy().ravel()
+    b_mod = mod.linear.bias.detach().numpy()
+    w_sk = sk.coef_.ravel()
+    print(f"max |w_sklearn - w_manual|  = {np.abs(w_sk - w_man).max():.2e}")
+    print(f"max |w_sklearn - w_module|  = {np.abs(w_sk - w_mod).max():.2e}")
+    print(f"max |w_manual  - w_module|  = {np.abs(w_man - w_mod).max():.2e}")
+
+    def probs(X):
+        out = {"sklearn": sk.predict_proba(X)[:, 1]}
+        out["manual"] = 1 / (1 + np.exp(-(X @ w_man + b_man)))
+        with torch.no_grad():
+            out["module"] = torch.sigmoid(mod(torch.tensor(X))).numpy()
+        return out
+
+    p_va, p_te = probs(X_va), probs(X_te)
+    print(f"max |p_sklearn - p_manual| (val) = {np.abs(p_va['sklearn'] - p_va['manual']).max():.2e}")
+    print(f"max |p_sklearn - p_module| (val) = {np.abs(p_va['sklearn'] - p_va['module']).max():.2e}")
+
+    # Results on the TEST set, threshold picked on validation
+    rows = [evaluate(k, y_va, p_va[k], y_te, p_te[k]) for k in ["sklearn", "manual", "module"]]
+    base_p = np.full(len(y_te), y_tr.mean())  # naive: everyone gets the train churn rate
+    rows.append({"model": "naive (train rate)", "threshold": np.nan,
+                 "test_auc": 0.5, "test_logloss": float(log_loss(y_te, base_p)),
+                 "test_cost": float(COST_FN * y_te.sum()),  # = contact nobody
+                 "cost_per_customer": float(COST_FN * y_te.sum() / len(y_te))})
+    table = pd.DataFrame(rows)
+    print("\nTEST results:")
+    print(table.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+    print(f"(contact everyone would cost {COST_FP * (y_te == 0).sum():.0f}; "
+          f"contact nobody costs {COST_FN * y_te.sum():.0f})")
+
+    # Save everything the app needs
+    joblib.dump(sk, ARTIFACTS / "sklearn_model.joblib")
+    torch.save({"w": torch.tensor(w_man), "b": torch.tensor(b_man)}, ARTIFACTS / "manual_params.pt")
+    torch.save(mod.state_dict(), ARTIFACTS / "module_state.pt")
+    np.savez(ARTIFACTS / "predictions.npz", y_val=y_va, y_test=y_te,
+             **{f"p_val_{k}": v for k, v in p_va.items()},
+             **{f"p_test_{k}": v for k, v in p_te.items()})
+    df.to_csv(ARTIFACTS / "clean_data.csv", index=False)
+    with open(ARTIFACTS / "metrics.json", "w") as f:
+        json.dump({"C": C, "lam": lam, "lr": LR, "epochs": EPOCHS,
+                   "cost_fn": COST_FN, "cost_fp": COST_FP,
+                   "feature_names": feature_names, "results": rows}, f, indent=2)
+    print("\nSaved artifacts to", ARTIFACTS)
 
 
 if __name__ == "__main__":

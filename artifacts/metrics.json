@@ -1,0 +1,64 @@
+{
+  "C": 10.0,
+  "lam": 2.3668639053254438e-05,
+  "lr": 0.5,
+  "epochs": 20000,
+  "cost_fn": 400.0,
+  "cost_fp": 50.0,
+  "feature_names": [
+    "num__tenure_log",
+    "num__MonthlyCharges",
+    "num__SeniorCitizen",
+    "num__is_echeck",
+    "num__contract_ord",
+    "cat__gender_Male",
+    "cat__Partner_Yes",
+    "cat__Dependents_Yes",
+    "cat__PhoneService_Yes",
+    "cat__MultipleLines_Yes",
+    "cat__InternetService_DSL",
+    "cat__InternetService_Fiber optic",
+    "cat__InternetService_No",
+    "cat__OnlineSecurity_Yes",
+    "cat__OnlineBackup_Yes",
+    "cat__DeviceProtection_Yes",
+    "cat__TechSupport_Yes",
+    "cat__StreamingTV_Yes",
+    "cat__StreamingMovies_Yes",
+    "cat__PaperlessBilling_Yes"
+  ],
+  "results": [
+    {
+      "model": "sklearn",
+      "threshold": 0.13,
+      "test_auc": 0.8402193288382547,
+      "test_logloss": 0.4209507662883919,
+      "test_cost": 35450.0,
+      "cost_per_customer": 25.1596877217885
+    },
+    {
+      "model": "manual",
+      "threshold": 0.13,
+      "test_auc": 0.8402399958665943,
+      "test_logloss": 0.4207126146810423,
+      "test_cost": 35500.0,
+      "cost_per_customer": 25.195173882185948
+    },
+    {
+      "model": "module",
+      "threshold": 0.13,
+      "test_auc": 0.8402399958665943,
+      "test_logloss": 0.4207126146810423,
+      "test_cost": 35500.0,
+      "cost_per_customer": 25.195173882185948
+    },
+    {
+      "model": "naive (train rate)",
+      "threshold": NaN,
+      "test_auc": 0.5,
+      "test_logloss": 0.5786668716736688,
+      "test_cost": 149600.0,
+      "cost_per_customer": 106.17459190915542
+    }
+  ]
+}
