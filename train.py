@@ -1,26 +1,47 @@
-"""
-Assignment 1 — training pipeline.
+"""Assignment 1: training pipeline (Telco customer churn)."""
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
 
-You're using a script for this stage. If you'd rather use a notebook,
-write train.ipynb instead and delete this file — main.py refuses to run if
-it finds both train.py and train.ipynb, so exactly one of them must exist.
+SEED = 42
+DATA_PATH = "data/telco.csv"
 
-Replace this docstring and everything below it with your own code. When run
-via `uv run python main.py train`, this file must, start to finish, with no
-manual steps in between:
 
-- Load your committed dataset.
-- Apply the feature engineering, preprocessing, and train/val/test split
-  consistent with the business framing you wrote in REPORT.md.
-- Train the same model — linear regression for a regression target,
-  logistic regression for a binary one — three ways, on the same split:
-  scikit-learn, a from-scratch PyTorch loop (Session 5's manual approach:
-  raw tensors, autograd, a manual gradient-step update), and the standard
-  torch.nn.Module + torch.optim workflow.
-- Evaluate all three against each other and against a naive baseline.
-- Save whatever app.py needs to build its dashboard without retraining
-  anything.
+def load_and_clean(path=DATA_PATH):
+    df = pd.read_csv(path)
 
-How you structure the code beyond that — file layout, function
-boundaries, naming — is your call to make and be able to defend.
-"""
+    # customerID is an identifier, so it carries no signal
+    df = df.drop(columns=["customerID"])
+
+    # TotalCharges is text because a few rows hold blank strings.
+    # Check that those are all customers with tenure == 0 before filling.
+    total = pd.to_numeric(df["TotalCharges"], errors="coerce")
+    blank = total.isna()
+    assert (df.loc[blank, "tenure"] == 0).all(), "blank TotalCharges with tenure > 0"
+    df["TotalCharges"] = total.fillna(0.0)
+
+    # Target: 1 = churned, 0 = stayed
+    df["Churn"] = (df["Churn"] == "Yes").astype(int)
+    return df
+
+
+def split_data(df):
+    # 60% train / 20% validation / 20% test, stratified on the target
+    train_df, temp_df = train_test_split(
+        df, test_size=0.4, stratify=df["Churn"], random_state=SEED
+    )
+    val_df, test_df = train_test_split(
+        temp_df, test_size=0.5, stratify=temp_df["Churn"], random_state=SEED
+    )
+    return train_df, val_df, test_df
+
+
+def main():
+    df = load_and_clean()
+    train_df, val_df, test_df = split_data(df)
+    for name, part in [("train", train_df), ("val", val_df), ("test", test_df)]:
+        print(f"{name}: {len(part)} rows, churn rate {part['Churn'].mean():.3f}")
+
+
+if __name__ == "__main__":
+    main()
