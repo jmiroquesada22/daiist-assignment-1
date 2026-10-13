@@ -24,7 +24,11 @@ COST_FP = 50.0
 
 # PyTorch optimisation settings (same for both PyTorch versions)
 LR = 0.5
-EPOCHS = 20000
+EPOCHS = 300000
+
+# Regularisation: pick the strongest (smallest C) within this log-loss tolerance of the best
+C_GRID = [0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0]
+C_TOLERANCE = 0.001
 
 ADDONS = ["OnlineSecurity", "OnlineBackup", "DeviceProtection",
           "TechSupport", "StreamingTV", "StreamingMovies"]
@@ -74,7 +78,9 @@ def build_preprocessor():
     return ColumnTransformer(
         [
             ("num", StandardScaler(), NUM_COLS),
-            ("cat", OneHotEncoder(drop="if_binary", handle_unknown="ignore"), CAT_COLS),
+            # drop="first" removes one reference category per feature, which
+            # removes the exact collinearity with the intercept
+            ("cat", OneHotEncoder(drop="first", handle_unknown="ignore"), CAT_COLS),
         ],
         sparse_threshold=0,
     )
@@ -95,13 +101,17 @@ def best_threshold(y, p):
 
 # ---------- model 1: scikit-learn ----------
 def fit_sklearn(X_tr, y_tr, X_val, y_val):
-    best = None
-    for C in [0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0]:  # the only tuned knob
+    fits = {}
+    for C in C_GRID:  # the only tuned knob
         m = LogisticRegression(C=C, max_iter=10000, tol=1e-10).fit(X_tr, y_tr)
-        ll = log_loss(y_val, m.predict_proba(X_val)[:, 1])
-        if best is None or ll < best[0]:
-            best = (ll, C, m)
-    return best[1], best[2]
+        fits[C] = (log_loss(y_val, m.predict_proba(X_val)[:, 1]), m)
+    best_ll = min(ll for ll, _ in fits.values())
+    print("C grid (validation log-loss):")
+    for C, (ll, _) in fits.items():
+        print(f"  C={C:<6} val log-loss {ll:.4f}")
+    # strongest regularisation (smallest C) within tolerance of the best
+    chosen = min(C for C, (ll, _) in fits.items() if ll <= best_ll + C_TOLERANCE)
+    return chosen, fits[chosen][1]
 
 
 # ---------- model 2: manual PyTorch loop ----------
@@ -153,6 +163,15 @@ def fit_module(X, y, lam, lr=LR, epochs=EPOCHS):
     return model
 
 
+# ---------- evaluation ----------
+def full_grad_norm(w, b, X, y, lam):
+    """Gradient norm of the regularised mean-loss objective; ~0 means converged."""
+    p = 1 / (1 + np.exp(-(X @ w + b)))
+    g_w = X.T @ (p - y) / len(y) + lam * w
+    g_b = np.mean(p - y)
+    return float(np.sqrt(np.sum(g_w ** 2) + np.sum(g_b ** 2)))
+
+
 def evaluate(name, y_val, p_val, y_test, p_test):
     thr = best_threshold(y_val, p_val)  # threshold chosen on VALIDATION only
     cost = expected_cost(y_test, p_test, thr)
@@ -174,6 +193,7 @@ def main():
     y_tr, y_va, y_te = (d["Churn"].to_numpy() for d in (train_df, val_df, test_df))
     joblib.dump(prep, ARTIFACTS / "preprocessor.joblib")
     feature_names = [str(n) for n in prep.get_feature_names_out()]
+    print("feature matrix shapes:", X_tr.shape, X_va.shape, X_te.shape)
 
     # Fit all three on the same train split
     C, sk = fit_sklearn(X_tr, y_tr, X_va, y_va)
@@ -186,6 +206,9 @@ def main():
     w_mod = mod.linear.weight.detach().numpy().ravel()
     b_mod = mod.linear.bias.detach().numpy()
     w_sk = sk.coef_.ravel()
+    for name, w, b in [("sklearn", w_sk, sk.intercept_), ("manual", w_man, b_man),
+                       ("module", w_mod, b_mod)]:
+        print(f"gradient norm {name:<8} = {full_grad_norm(w, b, X_tr, y_tr, lam):.2e}")
     print(f"max |w_sklearn - w_manual|  = {np.abs(w_sk - w_man).max():.2e}")
     print(f"max |w_sklearn - w_module|  = {np.abs(w_sk - w_mod).max():.2e}")
     print(f"max |w_manual  - w_module|  = {np.abs(w_man - w_mod).max():.2e}")
@@ -204,7 +227,7 @@ def main():
     # Results on the TEST set, threshold picked on validation
     rows = [evaluate(k, y_va, p_va[k], y_te, p_te[k]) for k in ["sklearn", "manual", "module"]]
     base_p = np.full(len(y_te), y_tr.mean())  # naive: everyone gets the train churn rate
-    rows.append({"model": "naive (train rate)", "threshold": np.nan,
+    rows.append({"model": "naive (train rate)", "threshold": float("nan"),
                  "test_auc": 0.5, "test_logloss": float(log_loss(y_te, base_p)),
                  "test_cost": float(COST_FN * y_te.sum()),  # = contact nobody
                  "cost_per_customer": float(COST_FN * y_te.sum() / len(y_te))})
